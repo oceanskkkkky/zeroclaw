@@ -115,7 +115,6 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
 }
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
-use uuid::Uuid;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
@@ -135,7 +134,7 @@ use zeroclaw_channels::whatsapp::WhatsAppChannel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
-use zeroclaw_memory::{self, Memory, MemoryCategory};
+use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::{self, ModelProvider};
 use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
@@ -173,10 +172,6 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
-
-fn webhook_memory_key() -> String {
-    format!("webhook_msg_{}", Uuid::new_v4())
-}
 
 #[cfg(feature = "channel-whatsapp-cloud")]
 fn whatsapp_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -3037,37 +3032,9 @@ async fn handle_webhook(
     let message = &webhook_body.message;
     let session_id = webhook_session_id(&headers);
 
-    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(message) {
-        let key = webhook_memory_key();
-        let _ = state
-            .mem
-            .store(
-                &key,
-                message,
-                MemoryCategory::Conversation,
-                session_id.as_deref(),
-            )
-            .await;
-    }
-
-    let model_label = {
-        let cfg = state.config.read();
-        let resolved_agent_alias = resolve_gateway_chat_agent_alias(&cfg, agent_override);
-        let resolved_provider = resolved_agent_alias
-            .as_deref()
-            .and_then(|alias| cfg.resolved_model_provider_for_agent(alias));
-        resolved_provider
-            .and_then(|(_, _, entry)| {
-                entry
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .map(ToString::to_string)
-            })
-            .or_else(|| cfg.resolve_default_model())
-            .unwrap_or_else(|| "<unresolved>".to_string())
-    };
+    // `process_message` is the single owner of chat auto-save. It constructs
+    // `AgentScopedMemory` after resolving the requested alias, applies the
+    // shared autosave filters, and prevents a duplicate/default-agent copy.
     // HTTP transport owns request latency and response mapping. The production
     // dispatch below enters `process_message`, whose runtime turn guard is the
     // sole owner of lifecycle and LLM events. Emitting another bracket here
@@ -3082,7 +3049,7 @@ async fn handle_webhook(
                 &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(duration),
             );
 
-            let body = serde_json::json!({"response": response, "model": model_label});
+            let body = serde_json::json!({"response": response});
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
@@ -5650,16 +5617,6 @@ path = "{trigger_path}"
     }
 
     #[test]
-    fn webhook_memory_key_is_unique() {
-        let key1 = webhook_memory_key();
-        let key2 = webhook_memory_key();
-
-        assert!(key1.starts_with("webhook_msg_"));
-        assert!(key2.starts_with("webhook_msg_"));
-        assert_ne!(key1, key2);
-    }
-
-    #[test]
     fn webhook_session_id_accepts_valid() {
         let mut headers = HeaderMap::new();
         headers.insert("X-Session-Id", HeaderValue::from_static("abc-DEF_123.foo"));
@@ -7098,7 +7055,11 @@ path = "{trigger_path}"
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
         let payload = response.into_body().collect().await.unwrap().to_bytes();
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(parsed["model"], "agent-model");
+        assert!(parsed.get("response").is_some());
+        assert!(
+            parsed.get("model").is_none(),
+            "webhook responses must not expose provider model metadata"
+        );
         let events = observer_impl.events.lock();
         assert!(
             !events.iter().any(|event| matches!(
@@ -7113,7 +7074,7 @@ path = "{trigger_path}"
     }
 
     #[tokio::test]
-    async fn webhook_autosave_stores_distinct_keys_per_request() {
+    async fn webhook_does_not_write_install_wide_memory() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
 
@@ -7211,10 +7172,10 @@ path = "{trigger_path}"
         assert_eq!(second.status(), StatusCode::OK);
 
         let keys = tracking_impl.keys.lock().clone();
-        assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0], keys[1]);
-        assert!(keys[0].starts_with("webhook_msg_"));
-        assert!(keys[1].starts_with("webhook_msg_"));
+        assert!(
+            keys.is_empty(),
+            "the HTTP gateway must not create default-agent autosave copies"
+        );
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
     }
 

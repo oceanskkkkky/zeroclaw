@@ -3989,6 +3989,8 @@ mod tests {
             approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
+            disclose_workspace_path: false,
+            disclose_runtime_info: false,
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],

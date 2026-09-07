@@ -394,11 +394,17 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     }
 
     // ── 4. Workspace ────────────────────────────────────────────
-    let _ = writeln!(
-        prompt,
-        "## Workspace\n\nWorking directory: `{}`\n",
-        workspace_dir.display()
-    );
+    if autonomy_config.is_none_or(|cfg| cfg.disclose_workspace_path) {
+        let _ = writeln!(
+            prompt,
+            "## Workspace\n\nWorking directory: `{}`\n",
+            workspace_dir.display()
+        );
+    } else {
+        prompt.push_str(
+            "## Workspace\n\nUse paths relative to your assigned workspace. Do not disclose internal filesystem paths.\n\n",
+        );
+    }
 
     // ── 5. Bootstrap files (injected into context) ──────────────
     prompt.push_str("## Project Context\n\n");
@@ -414,6 +420,15 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
                         prompt.push_str(&aieos_prompt);
                         prompt.push_str("\n\n");
                     }
+                    // AIEOS is the managed default identity. Workspace files
+                    // remain a later, agent-local customization layer.
+                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                    load_openclaw_bootstrap_files(
+                        &mut prompt,
+                        workspace_dir,
+                        max_chars,
+                        inject_memory,
+                    );
                 }
                 Ok(None) => {
                     // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
@@ -452,6 +467,8 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     }
 
     // ── 6. Date ─────────────────────────────────────────────────
+    // Exact local wall-clock time is added to each user turn by the runtime;
+    // this stable section supplies the local date and UTC offset.
     let now = chrono::Local::now();
     let _ = writeln!(
         prompt,
@@ -461,27 +478,27 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
     );
 
     // ── 7. Runtime ──────────────────────────────────────────────
-    let host =
-        hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-    // The shell is reported next to the OS because the OS alone does not
-    // determine it: on Windows `cmd.exe` and PowerShell are both reachable.
-    // Omitted entirely for shell-less runtimes, which read no worse than
-    // before. See `RuntimeAdapter::shell_profile`.
-    match shell_profile {
-        Some(profile) => {
-            let _ = writeln!(
-                prompt,
-                "## Runtime\n\nHost: {host} | OS: {} | Shell: {} | Model: {model_name}\n",
-                std::env::consts::OS,
-                profile.name,
-            );
-        }
-        None => {
-            let _ = writeln!(
-                prompt,
-                "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
-                std::env::consts::OS,
-            );
+    if autonomy_config.is_none_or(|cfg| cfg.disclose_runtime_info) {
+        let host =
+            hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
+        // The shell is reported next to the OS because the OS alone does not
+        // determine it: on Windows `cmd.exe` and PowerShell are both reachable.
+        match shell_profile {
+            Some(profile) => {
+                let _ = writeln!(
+                    prompt,
+                    "## Runtime\n\nHost: {host} | OS: {} | Shell: {} | Model: {model_name}\n",
+                    std::env::consts::OS,
+                    profile.name,
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    prompt,
+                    "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
+                    std::env::consts::OS,
+                );
+            }
         }
     }
 
@@ -738,6 +755,56 @@ mod tests {
             false,
             shell_profile,
         )
+    }
+
+    #[test]
+    fn managed_profile_hides_runtime_and_absolute_workspace_but_keeps_local_time() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            workspace.path().join("SOUL.md"),
+            "WORKSPACE_PERSONA_OVERRIDE",
+        )
+        .expect("write workspace persona");
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            disclose_workspace_path: false,
+            disclose_runtime_info: false,
+            ..Default::default()
+        };
+        let identity = zeroclaw_config::schema::IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: None,
+            aieos_inline: Some(r#"{"identity":{"names":{"first":"Managed Persona"}}}"#.into()),
+        };
+        let shell = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "bash".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+        };
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "private-model",
+            &[("file_read", "read a file")],
+            &[],
+            Some(&identity),
+            Some(512),
+            Some(&profile),
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            Some(&shell),
+        );
+
+        assert!(prompt.contains("## Current Date"));
+        assert!(prompt.contains("Managed Persona"));
+        assert!(prompt.contains("WORKSPACE_PERSONA_OVERRIDE"));
+        assert!(prompt.contains("Use paths relative to your assigned workspace"));
+        assert!(!prompt.contains(&workspace.path().display().to_string()));
+        assert!(!prompt.contains("private-model"));
+        assert!(!prompt.contains("Host:"));
+        assert!(!prompt.contains("OS:"));
+        assert!(!prompt.contains("Shell:"));
     }
 
     // ── Acceptance criteria from issue 9788 ────────────────────────────

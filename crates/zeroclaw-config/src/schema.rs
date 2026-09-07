@@ -12915,6 +12915,13 @@ pub struct RiskProfileConfig {
     /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
     /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
+    /// Include the absolute workspace path in the model system prompt.
+    /// Defaults to `true` for backwards compatibility; managed public agents
+    /// should disable it and use relative paths only.
+    pub disclose_workspace_path: bool,
+    /// Include host, operating system, shell and model information in the
+    /// model system prompt. Defaults to `true` for backwards compatibility.
+    pub disclose_runtime_info: bool,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.
     pub sandbox_enabled: Option<bool>,
@@ -12941,6 +12948,8 @@ impl Default for RiskProfileConfig {
             approval_route: None,
             allowed_tools: Vec::new(),
             excluded_tools: Vec::new(),
+            disclose_workspace_path: true,
+            disclose_runtime_info: true,
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
